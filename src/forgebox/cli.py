@@ -11,6 +11,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from typing import NoReturn
@@ -173,6 +174,20 @@ def _discard(repo: Path, args: argparse.Namespace) -> int:
     return 0
 
 
+def _anchor_repo(repo: Path) -> Path:
+    """Anchor to the Git top-level so subdir invocations act on the repo."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return Path(result.stdout.strip()).resolve()
+    except Exception:
+        pass
+    return repo
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run a command; return 0, 1 for operational errors, or 2 for bad usage."""
     parser = _Parser(prog="forgebox", description="Try changes in a disposable Git worktree.")
@@ -200,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 1
     try:
-        return args.handler(args.repo.expanduser().resolve(), args)
+        return args.handler(_anchor_repo(args.repo.expanduser().resolve()), args)
     except Exception as exc:
         if getattr(args, "json", False):
             print(json.dumps({"error": str(exc)}))

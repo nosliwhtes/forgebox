@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import re
-import shlex
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,7 +27,9 @@ _PATH_KEYS = {
     "target", "output_path", "input_path", "repo_root", "root",
 }
 _COMMAND_KEYS = {"command", "cmd", "shell_command"}
-_SHELL_WORD = re.compile(r"'(?:[^']*)'|\"(?:[^\"\\]|\\.)*\"|[^\s'\"<>|;&()]+")
+# Characters that mark a shell word as something other than a bare path:
+# assignments, expressions, globs, redirections, control operators, etc.
+_SHELL_SPECIAL = set("=()$`;&|<>*?[]{}!#")
 
 
 class _OutsideSandbox(ValueError):
@@ -77,19 +77,81 @@ def _get_session(params: dict) -> tuple[Any, Path, Path, Journal] | None:
     return snapshot, repo, worktree, Journal(repo / ".forgebox" / session_id / "journal.jsonl")
 
 
-def _pathlike(value: str) -> bool:
-    if "://" in value:
+def _bare_pathlike(token: str) -> bool:
+    """A bare shell word that looks like a path, not an expression/flag."""
+    if not token or any(c in _SHELL_SPECIAL for c in token):
         return False
-    return value.startswith(("/", "~/", "./", "../")) or "/" in value
+    if "://" in token:
+        return False
+    return token.startswith(("/", "~/", "./", "../")) or "/" in token
 
 
-def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path) -> str:
+def _split_option(token: str) -> tuple[str, str]:
+    """Split a leading option word from an attached path (-I./inc -> ('-I', './inc'))."""
+    i, n = 0, len(token)
+    if token.startswith("-"):
+        i = 1
+        if n > 1 and token[1] == "-":
+            i = 2
+        while i < n and (token[i].isalnum() or token[i] in "-_"):
+            i += 1
+        if i >= n:
+            return "", token
+        if token[i] == "=":
+            i += 1
+        return token[:i], token[i:]
+    return "", token
+
+
+def _shell_tokens(command: str) -> list[tuple[str, bool]]:
+    """Split a POSIX-ish command into (token, was_quoted) pairs.
+
+    Quotes are consumed but remembered: a token that was quoted (even partially)
+    is left untouched by path rewriting, since quoting signals a literal
+    argument (a sed script, a pattern, a string constant, ...) rather than a
+    filesystem reference.
+    """
+    tokens = []
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        start = i
+        quoted = False
+        while i < n:
+            c = command[i]
+            if c in ("'", '"'):
+                quote = c
+                i += 1
+                quoted = True
+                while i < n and command[i] != quote:
+                    if quote == '"' and command[i] == "\\" and i + 1 < n:
+                        i += 2
+                    else:
+                        i += 1
+                if i < n:
+                    i += 1
+                continue
+            if c in " \t\r\n":
+                break
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            i += 1
+        tokens.append((command[start:i], quoted))
+    return tokens
+
+
+def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path, base: Path) -> str:
     path = Path(value).expanduser()
+    trailing = isinstance(value, str) and value.endswith("/")
     if not path.is_absolute():
-        path = repo / path
+        path = base / path
     path = path.resolve()
     if path.is_relative_to(worktree):
-        return str(path)
+        return str(path) + ("/" if trailing else "")
     if not path.is_relative_to(repo):
         raise _OutsideSandbox("path outside sandbox")
     target = worktree / path.relative_to(repo)
@@ -97,51 +159,52 @@ def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path) -> str:
     # the original real-repo path did not.
     if not target.resolve().is_relative_to(worktree):
         raise _OutsideSandbox("path outside sandbox")
-    return str(target)
+    return str(target) + ("/" if trailing else "")
 
 
-def _rewrite_command(command: str, repo: Path, worktree: Path) -> str:
-    def replace(match: re.Match) -> str:
-        raw = match.group()
-        try:
-            words = shlex.split(raw)
-        except ValueError:
-            return raw
-        if len(words) != 1:
-            return raw
-        word = words[0]
-        prefix = ""
-        if "=" in word:
-            option, candidate = word.split("=", 1)
-            if option.startswith("-") or re.fullmatch(r"[A-Za-z_]\w*", option):
-                prefix, word = option + "=", candidate
-        if not _pathlike(word):
-            return raw
-        mapped = _rewrite_path(word, repo, worktree)
-        return shlex.quote(prefix + mapped)
-    return _SHELL_WORD.sub(replace, command)
+def _rewrite_command(command: str, repo: Path, worktree: Path, base: Path) -> str:
+    rebuilt = []
+    for token, quoted in _shell_tokens(command):
+        if quoted:
+            rebuilt.append(token)
+            continue
+        prefix, rest = _split_option(token)
+        if prefix and _bare_pathlike(rest):
+            rebuilt.append(prefix + _rewrite_path(rest, repo, worktree, base))
+        elif _bare_pathlike(token):
+            rebuilt.append(_rewrite_path(token, repo, worktree, base))
+        else:
+            rebuilt.append(token)
+    return " ".join(rebuilt)
 
 
-def _rewrite(value: Any, repo: Path, worktree: Path, key: str = "") -> Any:
+def _caller_base(args: dict, repo: Path) -> Path:
+    """Anchor relative paths to the caller's cwd when it is inside the repo."""
+    raw = args.get("cwd") or args.get("workdir") or args.get("working_directory")
+    if raw is not None and isinstance(raw, (str, os.PathLike)):
+        return Path(raw).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    return cwd if cwd.is_relative_to(repo) else repo
+
+
+def _rewrite(value: Any, repo: Path, worktree: Path, base: Path, key: str = "") -> Any:
     if isinstance(value, dict):
-        return {k: _rewrite(v, repo, worktree, str(k).lower()) for k, v in value.items()}
+        return {k: _rewrite(v, repo, worktree, base, str(k).lower()) for k, v in value.items()}
     if isinstance(value, list):
-        return [_rewrite(item, repo, worktree, key) for item in value]
+        return [_rewrite(item, repo, worktree, base, key) for item in value]
     if isinstance(value, tuple):
-        return tuple(_rewrite(item, repo, worktree, key) for item in value)
+        return tuple(_rewrite(item, repo, worktree, base, key) for item in value)
     if isinstance(value, os.PathLike):
-        return _rewrite_path(value, repo, worktree)
+        return _rewrite_path(value, repo, worktree, base)
     if not isinstance(value, str) or not value:
         return value
     if key in _COMMAND_KEYS:
-        return _rewrite_command(value, repo, worktree)
+        return _rewrite_command(value, repo, worktree, base)
     if key in _PATH_KEYS or key.endswith(("_path", "_paths", "_file", "_dir")):
         # A source/destination field can be a URL rather than a local path.
         if "://" in value:
             return value
-        return _rewrite_path(value, repo, worktree)
-    if value.startswith(("/", "~/", "./", "../")) and "\n" not in value and "://" not in value:
-        return _rewrite_path(value, repo, worktree)
+        return _rewrite_path(value, repo, worktree, base)
     return value
 
 
@@ -196,12 +259,20 @@ def pre_tool_call(params: dict) -> dict | None:
     _, repo, worktree, _ = session
     args = params.get("args") or {}
     try:
-        rewritten = _rewrite(args, repo, worktree)
-        if isinstance(rewritten, dict) and any(k in rewritten for k in _COMMAND_KEYS):
-            # Relative shell paths must execute in the worktree as well.
-            if not any(k in rewritten for k in ("cwd", "workdir", "working_directory")):
-                key = "workdir" if params.get("name") == "terminal" else "cwd"
-                rewritten[key] = str(worktree)
+        args = {**args}
+        cwd_key = "workdir" if params.get("name") == "terminal" else "cwd"
+        provided = args.get("cwd") or args.get("workdir") or args.get("working_directory")
+        base = _caller_base(args, repo)
+        if provided is not None and isinstance(provided, (str, os.PathLike)):
+            if Path(provided).expanduser().resolve().is_relative_to(repo):
+                # A command requested from inside the repo runs in the sandbox.
+                args[cwd_key] = str(worktree)
+                base = worktree
+        elif any(k in args for k in _COMMAND_KEYS):
+            # Default execution cwd for shell tools becomes the sandbox worktree.
+            args[cwd_key] = str(worktree)
+            base = worktree
+        rewritten = _rewrite(args, repo, worktree, base)
     except (_OutsideSandbox, OSError, RuntimeError, ValueError):
         result = {"abort": True, "reason": "path outside sandbox"}
         _record(session, params, "pre_tool_call", aborted=True, reason=result["reason"])

@@ -58,12 +58,27 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _repo_root(path: Path) -> Path:
+    """Return the main worktree root even when started from a linked worktree.
+
+    ``--show-toplevel`` echoes the enclosing checkout; inside a linked
+    worktree that is the linked checkout, not the repository root that owns
+    the ``refs/forgebox`` namespace.
+    """
+    top = Path(_git(path, "rev-parse", "--show-toplevel")).resolve()
+    if (top / ".git").is_file():
+        common = Path(_git(path, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        if common.name == ".git" and (common.parent / ".git").is_dir():
+            return common.parent.resolve()
+    return top
+
+
 def _repo(params: dict) -> Path:
     raw = params.get("repo") or params.get("repo_root") or params.get("cwd")
     if raw is not None and not isinstance(raw, str):
         raise ValueError("repo must be a path string")
-    path = Path(raw).expanduser().resolve() if raw else Path.cwd()
-    return Path(_git(path, "rev-parse", "--show-toplevel")).resolve()
+    path = Path(raw.strip()).expanduser().resolve() if raw else Path.cwd()
+    return _repo_root(path)
 
 
 def _sessions(repo: Path) -> list[dict]:
