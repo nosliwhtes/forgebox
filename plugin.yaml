@@ -1,0 +1,16 @@
+name: forgebox
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: >-
+  Transactional try-then-commit execution backend. Forgebox runs agent
+  tool commands in disposable git worktrees, journals every command with its
+  exit code, and applies changes to the real repository only after an
+  explicit, conflict-checked approval.
+license: MIT
+homepage: https://github.com/nosliwhtes/forgebox
+tags: [automation, git, safety, desktop]
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - post_approval_response
