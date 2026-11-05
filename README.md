@@ -16,11 +16,11 @@ Forgebox makes the experiment a transaction: **begin → edit and test → revie
 
 - Snapshot dirty work without requiring a stash or a preparatory commit.
 - Run experiments in a detached Git worktree.
-- Redirect supported Hermes tool-path arguments into that worktree and reject paths outside the repo through hooks.
+- Best-effort redirect known Hermes file-path arguments and command working directories into that worktree; reject recognized path arguments outside it.
 - Inspect a unified diff, including newly created files.
 - Review a JSONL journal of tool calls and reported execution results.
 - Detect changes to affected real-repo files before applying anything.
-- Apply the whole patch or nothing; discard the worktree when the attempt is not worth keeping.
+- Stage the patch before applying, with rollback protection for ordinary write failures; discard experiments you do not want.
 - Use the CLI or the Hermes desktop pane for review and session controls.
 
 ## Install
@@ -98,14 +98,14 @@ forgebox discard --repo "$REPO"
 
 To request a Git commit, use `forgebox apply --repo "$REPO" --commit-message "Accept agent experiment"`. Review your existing staged and dirty work first: optional commit handling stages changes in the real repo. `--force` explicitly bypasses conflict protection; it is not the normal review path.
 
-With registered Hermes hooks active, supported file-path arguments are redirected for the agent and tool calls are journaled. Commands you run directly in another shell are not automatically intercepted or journaled.
+With registered Hermes hooks active (Hermes 0.21.6+), supported file-path arguments and command working directories are redirected and tool calls are journaled. Shell source is preserved verbatim to avoid corrupting scripts, literals, and here-documents. Absolute paths in shell commands, `cd`, dynamically generated paths, and subprocess writes are not rewritten or contained. Commands you run directly in another shell are not intercepted or journaled. Supported file tools are `read_file`, `write_file`, `search_files`, and `patch` replace mode. Multi-file `patch` mode is blocked during an active session because its embedded headers are not redirected. Unknown plugin-tool fields are left untouched. Approval hooks only record decisions; apply explicitly with `forgebox apply` or the dashboard/Desktop panel.
 
 ## Architecture
 
 ```text
 Dirty repo → temporary-index snapshot commit → detached worktree
 Hermes hooks → path checks and rewrites → JSONL journal
-Worktree diff + current repo → preflight → atomic apply | discard
+Worktree diff + current repo → preflight → staged apply + rollback | discard
 Desktop pane → JSON handlers → session, diff, and action controls
 ```
 
@@ -113,10 +113,12 @@ See [ARCH.md](ARCH.md) for the module boundaries and public interfaces.
 
 ## Safety guarantees and limits
 
-- **Sandbox:** supported hook-mediated path arguments are checked and redirected. This is a worktree and hook boundary, not an OS security sandbox. Do not rely on it to contain hostile shell commands, subprocesses, network calls, or external services.
+- **Advisory redirection:** known hook-mediated file-path arguments and command working directories are checked and redirected on a best-effort basis. Shell command text is not rewritten. This is a worktree workflow, not an OS security sandbox. Do not rely on it to contain hostile shell commands, subprocesses, network calls, or external services.
 - **Preserve the starting point:** snapshots use a temporary Git index. Begin does not stage your work in the real index or require a normal commit. Session files and worktrees live under `.forgebox/`.
 - **Preflight conflicts:** every path the experiment changes is compared with its snapshot state in the real repo. If an affected file changed, default apply refuses the transaction rather than silently overwriting it. `--force` opts out.
-- **Atomic apply:** the patch is checked before application; a rejected patch must not leave a partially applied change set. This does not promise power-loss durability or make an optional Git commit part of the same filesystem transaction.
+- **Rollback-protected apply:** the patch is checked and applied in staging before live files change. Renamed originals are retained until installation succeeds, and ordinary write failures trigger rollback. If rollback also fails, the error names the recovery directory under `.forgebox/apply-*`; preserve it and recover the originals before retrying. This is not crash-atomic or safe against simultaneous external editors, and optional Git commits are separate.
+- **Checkout ownership:** sessions belong to the checkout where they began. Main and linked worktrees have separate session lists and apply destinations. Run the CLI or panel from that checkout or its subdirectories.
+- **Sparse checkout:** omitted paths retain their actual indexed blobs, including staged changes. Applying an edit may materialize an omitted file without changing the real index. To apply a deletion of an omitted file, first include that path in the sparse checkout; otherwise preflight refuses it rather than silently resurrecting the indexed file later.
 - **Discard:** removes the disposable worktree and snapshot reference without copying experimental edits back. It does not undo external side effects, erase the execution journal, or reverse an earlier apply.
 
 ## Demo
@@ -126,3 +128,16 @@ The [demo storyboard](docs/DEMO.md) starts with a dirty repo, discards a broken 
 ## License
 
 [MIT](LICENSE). Source: [nosliwhtes/forgebox](https://github.com/nosliwhtes/forgebox).
+
+
+## Development checks
+
+```bash
+python -m pip install -e . pytest
+python -m pytest tests/
+```
+
+The Hermes integration job also checks the real PluginManager against Hermes
+0.21.6 (pinned in CI). To run it locally, check out that Hermes version, install
+`ruamel.yaml`, and set `HERMES_SOURCE=/path/to/hermes-agent` when running pytest.
+Without Hermes available, only that integration module is skipped.

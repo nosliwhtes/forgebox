@@ -1,8 +1,8 @@
-"""Forgebox's dict-in/dict-out Hermes hook entry points.
+"""Forgebox's keyword-argument Hermes hook entry points.
 
 Session discovery uses .forgebox/active.json in the current repo or an ancestor.
 The file contains Snapshot fields, optionally nested under ``snapshot``. Hosts
-may instead pass ``snapshot`` in params; ``repo_root`` (or FORGEBOX_REPO_ROOT)
+may instead pass ``snapshot`` as a keyword; ``repo_root`` (or FORGEBOX_REPO_ROOT)
 selects a repo when the host's working directory is elsewhere. No active
 snapshot/worktree means no action. Shell argument inspection is advisory, not
 an OS sandbox: dynamically generated paths cannot be proved safe here.
@@ -23,15 +23,14 @@ from .journal import Journal
 _PATH_KEYS = {
     "path", "paths", "file", "files", "filename", "filenames", "file_path",
     "file_paths", "filepath", "directory", "directories", "dir", "cwd",
-    "workdir", "working_directory", "source", "destination", "src", "dest",
-    "target", "output_path", "input_path", "repo_root", "root",
+    "workdir", "working_directory", "destination", "dest",
+    "source_path", "destination_path", "output_path", "input_path", "repo_root",
 }
 _COMMAND_KEYS = {"command", "cmd", "shell_command"}
-# Characters that mark a shell word as something other than a bare path:
-# assignments, expressions, globs, redirections, control operators, etc.
-_SHELL_SPECIAL = set("=()$`;&|<>*?[]{}!#")
-
-
+# Hermes 0.21.6 file-tool schemas. Do not infer path semantics for arbitrary
+# plugin fields (e.g. search_files.target is an enum, not a file).
+_TOOL_PATH_KEYS = {name: {"path"} for name in
+                   ("read_file", "write_file", "patch", "search_files")}
 class _OutsideSandbox(ValueError):
     pass
 
@@ -39,20 +38,34 @@ class _OutsideSandbox(ValueError):
 def _get_session(params: dict) -> tuple[Any, Path, Path, Journal] | None:
     snapshot = params.get("snapshot")
     if snapshot is None:
-        location = params.get("repo_root") or os.environ.get("FORGEBOX_REPO_ROOT") or Path.cwd()
-        start = Path(location).expanduser().resolve()
-        for root in (start, *start.parents):
-            state = root / ".forgebox" / "active.json"
-            try:
-                metadata = json.loads(state.read_text(encoding="utf-8"))
-            except FileNotFoundError:
+        args = params.get("args") or {}
+        location = params.get("repo_root") or os.environ.get("FORGEBOX_REPO_ROOT")
+        requested_cwd = next((args.get(key) for key in
+                              ("workdir", "cwd", "working_directory")
+                              if isinstance(args.get(key), (str, os.PathLike)) and args.get(key)), None)
+        locations = [location] if location else [requested_cwd, Path.cwd()]
+        seen = set()
+        for location in locations:
+            if location is None:
                 continue
-            except (OSError, ValueError):
-                return None
-            if not isinstance(metadata, dict):
-                return None
-            snapshot = metadata.get("snapshot", metadata)
-            break
+            start = Path(location).expanduser().resolve()
+            for root in (start, *start.parents):
+                if root in seen:
+                    continue
+                seen.add(root)
+                state = root / ".forgebox" / "active.json"
+                try:
+                    metadata = json.loads(state.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError):
+                    return None
+                if not isinstance(metadata, dict):
+                    return None
+                snapshot = metadata.get("snapshot", metadata)
+                break
+            if snapshot is not None:
+                break
     if snapshot is None:
         return None
     if isinstance(snapshot, dict):
@@ -77,73 +90,6 @@ def _get_session(params: dict) -> tuple[Any, Path, Path, Journal] | None:
     return snapshot, repo, worktree, Journal(repo / ".forgebox" / session_id / "journal.jsonl")
 
 
-def _bare_pathlike(token: str) -> bool:
-    """A bare shell word that looks like a path, not an expression/flag."""
-    if not token or any(c in _SHELL_SPECIAL for c in token):
-        return False
-    if "://" in token:
-        return False
-    return token.startswith(("/", "~/", "./", "../")) or "/" in token
-
-
-def _split_option(token: str) -> tuple[str, str]:
-    """Split a leading option word from an attached path (-I./inc -> ('-I', './inc'))."""
-    i, n = 0, len(token)
-    if token.startswith("-"):
-        i = 1
-        if n > 1 and token[1] == "-":
-            i = 2
-        while i < n and (token[i].isalnum() or token[i] in "-_"):
-            i += 1
-        if i >= n:
-            return "", token
-        if token[i] == "=":
-            i += 1
-        return token[:i], token[i:]
-    return "", token
-
-
-def _shell_tokens(command: str) -> list[tuple[str, bool]]:
-    """Split a POSIX-ish command into (token, was_quoted) pairs.
-
-    Quotes are consumed but remembered: a token that was quoted (even partially)
-    is left untouched by path rewriting, since quoting signals a literal
-    argument (a sed script, a pattern, a string constant, ...) rather than a
-    filesystem reference.
-    """
-    tokens = []
-    i, n = 0, len(command)
-    while i < n:
-        c = command[i]
-        if c in " \t\r\n":
-            i += 1
-            continue
-        start = i
-        quoted = False
-        while i < n:
-            c = command[i]
-            if c in ("'", '"'):
-                quote = c
-                i += 1
-                quoted = True
-                while i < n and command[i] != quote:
-                    if quote == '"' and command[i] == "\\" and i + 1 < n:
-                        i += 2
-                    else:
-                        i += 1
-                if i < n:
-                    i += 1
-                continue
-            if c in " \t\r\n":
-                break
-            if c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            i += 1
-        tokens.append((command[start:i], quoted))
-    return tokens
-
-
 def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path, base: Path) -> str:
     path = Path(value).expanduser()
     trailing = isinstance(value, str) and value.endswith("/")
@@ -162,47 +108,31 @@ def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path, base: Pa
     return str(target) + ("/" if trailing else "")
 
 
-def _rewrite_command(command: str, repo: Path, worktree: Path, base: Path) -> str:
-    rebuilt = []
-    for token, quoted in _shell_tokens(command):
-        if quoted:
-            rebuilt.append(token)
-            continue
-        prefix, rest = _split_option(token)
-        if prefix and _bare_pathlike(rest):
-            rebuilt.append(prefix + _rewrite_path(rest, repo, worktree, base))
-        elif _bare_pathlike(token):
-            rebuilt.append(_rewrite_path(token, repo, worktree, base))
-        else:
-            rebuilt.append(token)
-    return " ".join(rebuilt)
-
-
-def _caller_base(args: dict, repo: Path) -> Path:
-    """Anchor relative paths to the caller's cwd when it is inside the repo."""
-    raw = args.get("cwd") or args.get("workdir") or args.get("working_directory")
-    if raw is not None and isinstance(raw, (str, os.PathLike)):
-        return Path(raw).expanduser().resolve()
+def _caller_base(args: dict, repo: Path, worktree: Path) -> Path:
+    """Resolve an explicit relative cwd against the caller, not against itself."""
     cwd = Path.cwd().resolve()
-    return cwd if cwd.is_relative_to(repo) else repo
+    caller = cwd if cwd.is_relative_to(repo) or cwd.is_relative_to(worktree) else repo
+    raw = args.get("workdir") or args.get("cwd") or args.get("working_directory")
+    if isinstance(raw, (str, os.PathLike)) and raw:
+        path = Path(raw).expanduser()
+        return (path if path.is_absolute() else caller / path).resolve()
+    return caller
 
 
 def _rewrite(value: Any, repo: Path, worktree: Path, base: Path, key: str = "") -> Any:
+    # Only recognized top-level tool arguments are paths. Content dictionaries
+    # may themselves contain keys named path/source and must remain literal.
     if isinstance(value, dict):
-        return {k: _rewrite(v, repo, worktree, base, str(k).lower()) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_rewrite(item, repo, worktree, base, key) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_rewrite(item, repo, worktree, base, key) for item in value)
-    if isinstance(value, os.PathLike):
-        return _rewrite_path(value, repo, worktree, base)
-    if not isinstance(value, str) or not value:
+        return {k: _rewrite(v, repo, worktree, base, str(k).lower())
+                if not isinstance(v, dict) else v for k, v in value.items()}
+    if key not in _PATH_KEYS:
         return value
-    if key in _COMMAND_KEYS:
-        return _rewrite_command(value, repo, worktree, base)
-    if key in _PATH_KEYS or key.endswith(("_path", "_paths", "_file", "_dir")):
-        # A source/destination field can be a URL rather than a local path.
-        if "://" in value:
+    if isinstance(value, (list, tuple)):
+        rewritten = [_rewrite(item, repo, worktree, base, key)
+                     if isinstance(item, (str, os.PathLike)) else item for item in value]
+        return tuple(rewritten) if isinstance(value, tuple) else rewritten
+    if isinstance(value, (str, os.PathLike)) and value:
+        if isinstance(value, str) and "://" in value:
             return value
         return _rewrite_path(value, repo, worktree, base)
     return value
@@ -239,10 +169,10 @@ def _record(session: tuple, params: dict, event: str, **extra: Any) -> None:
         except ValueError:
             result = None
     exit_code = result.get("exit_code", result.get("returncode")) if isinstance(result, dict) else None
-    command = args.get("command", args.get("cmd", params.get("name"))) if isinstance(args, dict) else params.get("name")
+    command = args.get("command", args.get("cmd", params.get("tool_name"))) if isinstance(args, dict) else params.get("tool_name")
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "event": event,
-        "task_id": params.get("task_id"), "name": params.get("name"),
+        "task_id": params.get("task_id"), "name": params.get("tool_name"),
         "command": command, "exit_code": exit_code,
         "changed_files": sorted(set(_paths(args, repo, worktree) + _paths(result, repo, worktree))),
     }
@@ -252,52 +182,59 @@ def _record(session: tuple, params: dict, event: str, **extra: Any) -> None:
     journal.append(entry)
 
 
-def pre_tool_call(params: dict) -> dict | None:
+def pre_tool_call(tool_name: str = "", args: dict | None = None,
+                  session_id: str = "", task_id: str = "", **kwargs) -> dict | None:
+    params = {**kwargs, "tool_name": tool_name, "args": args or {},
+              "session_id": session_id, "task_id": task_id}
     session = _get_session(params)
     if session is None:
         return None
     _, repo, worktree, _ = session
-    args = params.get("args") or {}
+    original = args or {}
     try:
-        args = {**args}
-        cwd_key = "workdir" if params.get("name") == "terminal" else "cwd"
-        provided = args.get("cwd") or args.get("workdir") or args.get("working_directory")
-        base = _caller_base(args, repo)
-        if provided is not None and isinstance(provided, (str, os.PathLike)):
-            if Path(provided).expanduser().resolve().is_relative_to(repo):
-                # A command requested from inside the repo runs in the sandbox.
-                args[cwd_key] = str(worktree)
-                base = worktree
-        elif any(k in args for k in _COMMAND_KEYS):
-            # Default execution cwd for shell tools becomes the sandbox worktree.
-            args[cwd_key] = str(worktree)
-            base = worktree
-        rewritten = _rewrite(args, repo, worktree, base)
+        base = _caller_base(original, repo, worktree)
+        # Cwd fields are relative to the caller, while other paths are relative
+        # to the requested cwd. Do not flatten a requested subdirectory.
+        cwd_keys = {"cwd", "workdir", "working_directory"}
+        if tool_name == "patch" and original.get("mode") == "patch":
+            result = {"action": "block", "message":
+                      "Forgebox: multi-file patch mode is not redirected; use patch replace mode or write_file"}
+            _record(session, params, "pre_tool_call", aborted=True, reason=result["message"])
+            return result
+        path_keys = _TOOL_PATH_KEYS.get(tool_name, set())
+        path_args = {k: v for k, v in original.items() if k in path_keys}
+        if tool_name == "search_files" and not path_args.get("path"):
+            path_args["path"] = "."
+        rewritten = {**original, **_rewrite(path_args, repo, worktree, base)}
+        for key in cwd_keys.intersection(original):
+            rewritten[key] = _rewrite_path(base, repo, worktree, repo)
+        if tool_name == "terminal" and any(key in original for key in _COMMAND_KEYS):
+            cwd_key = "workdir" if tool_name == "terminal" else "cwd"
+            rewritten[cwd_key] = _rewrite_path(base, repo, worktree, repo)
     except (_OutsideSandbox, OSError, RuntimeError, ValueError):
-        result = {"abort": True, "reason": "path outside sandbox"}
-        _record(session, params, "pre_tool_call", aborted=True, reason=result["reason"])
+        result = {"action": "block", "message": "Forgebox: path outside sandbox"}
+        _record(session, params, "pre_tool_call", aborted=True, reason=result["message"])
         return result
     _record(session, params, "pre_tool_call")
-    return {"args": rewritten} if rewritten != args else None
+    return {"action": "modify", "args": rewritten} if rewritten != original else None
 
 
-def post_tool_call(params: dict) -> dict | None:
+def post_tool_call(tool_name: str = "", args: dict | None = None, result: Any = None,
+                   session_id: str = "", task_id: str = "", **kwargs) -> None:
+    params = {**kwargs, "tool_name": tool_name, "args": args or {}, "result": result,
+              "session_id": session_id, "task_id": task_id}
     session = _get_session(params)
     if session is not None:
         _record(session, params, "post_tool_call")
     return None
 
 
-def post_approval_response(params: dict) -> dict | None:
+def post_approval_response(choice: str = "", session_key: str = "",
+                           command: str = "", **kwargs) -> None:
+    """Observe approval decisions only; applying requires CLI/dashboard action."""
+    params = {**kwargs, "args": {"command": command}, "session_key": session_key}
     session = _get_session(params)
-    if session is None:
-        return None
-    if params.get("approved") is True and params.get("pending") == "apply":
-        from .core.apply import apply
-
-        snapshot, repo, worktree, _ = session
-        result = apply(repo, snapshot, worktree)
-        _record(session, params, "post_approval_response", approved=True, pending="apply", result=result)
-        return result
-    _record(session, params, "post_approval_response", approved=params.get("approved"), pending=params.get("pending"))
+    if session is not None:
+        _record(session, params, "post_approval_response", choice=choice,
+                decided_by=kwargs.get("decided_by"), session_key=session_key)
     return None

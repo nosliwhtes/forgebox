@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -31,3 +31,27 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m pytest tests/ -q
+
+  hermes-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Forgebox
+        uses: actions/checkout@v4
+      - name: Check out supported Hermes release
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          # v0.21.6, pinned so upstream changes cannot silently alter this contract test.
+          ref: 818c13be1dc4fd28987e1e881a9408224afd4535
+          path: .hermes-integration
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install integration dependencies
+        run: pip install -e . pytest 'ruamel.yaml>=0.18,<0.20'
+      - name: Exercise real Hermes registration and dispatch
+        env:
+          HERMES_SOURCE: ${{ github.workspace }}/.hermes-integration
+          PYTHONPATH: src
+        run: python -m pytest tests/test_plugin_integration.py -q

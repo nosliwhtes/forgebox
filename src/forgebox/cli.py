@@ -11,7 +11,6 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 from typing import NoReturn
@@ -175,17 +174,13 @@ def _discard(repo: Path, args: argparse.Namespace) -> int:
 
 
 def _anchor_repo(repo: Path) -> Path:
-    """Anchor to the Git top-level so subdir invocations act on the repo."""
+    """Anchor to the owning checkout without trimming valid path characters."""
+    from forgebox.core.snapshot import SnapshotError, _session_root
+
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return Path(result.stdout.strip()).resolve()
-    except Exception:
-        pass
-    return repo
+        return _session_root(repo)
+    except SnapshotError:
+        return repo
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,3 +221,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

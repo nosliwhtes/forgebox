@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -58,7 +59,7 @@ def _root(path: Path) -> Path:
     path = Path(path).resolve()
     if _git(path, 'rev-parse', '--is-inside-work-tree').strip() != b'true':
         raise SnapshotError(f'Not a Git working tree: {path}')
-    return Path(os.fsdecode(_git(path, 'rev-parse', '--show-toplevel').rstrip(b'\n'))).resolve()
+    return Path(os.fsdecode(_git(path, 'rev-parse', '--show-toplevel').removesuffix(b'\n'))).resolve()
 
 
 def _validate(snap: Snapshot, repo_root: Path | None = None) -> Path:
@@ -67,6 +68,9 @@ def _validate(snap: Snapshot, repo_root: Path | None = None) -> Path:
     if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', snap.commit_sha):
         raise SnapshotError('Invalid snapshot commit')
     root = _root(snap.repo_root)
+    owner = _snapshot_owner(root, snap.commit_sha)
+    if owner is not None and owner != root:
+        raise SnapshotError('Snapshot belongs to a different checkout')
     if repo_root is not None and _root(repo_root) != root:
         raise SnapshotError('Snapshot belongs to a different repository')
     return root
@@ -88,6 +92,53 @@ def _tree_entries(root: Path, tree: str) -> dict[str, tuple[str, str]]:
             mode, _kind, sha = metadata.split()
             entries[os.fsdecode(path)] = (mode.decode(), sha.decode())
     return entries
+
+
+def _sparse_entries(root: Path) -> dict[str, tuple[str, str]]:
+    """Return omitted stage-zero entries from the actual index, not HEAD.
+
+    A sparse path can have a staged change. Its absence on disk must preserve
+    that staged blob in the snapshot without changing the real index flags.
+    """
+    entries = {}
+    for record in _git(root, 'ls-files', '-t', '--stage', '-z').split(b'\0'):
+        if not record.startswith(b'S '):
+            continue
+        metadata, raw_path = record[2:].split(b'\t', 1)
+        mode, sha, stage = metadata.split()
+        if stage == b'0':
+            entries[os.fsdecode(raw_path)] = (mode.decode(), sha.decode())
+    return entries
+
+
+def _snapshot_owner(root: Path, commit: str) -> Path | None:
+    """Read checkout ownership recorded in new snapshot commits."""
+    message = _git(root, 'show', '-s', '--format=%B', commit).decode('utf-8')
+    for line in message.splitlines():
+        if line.startswith('Forgebox-Owner: '):
+            try:
+                owner = json.loads(line.removeprefix('Forgebox-Owner: '))
+            except ValueError as exc:
+                raise SnapshotError('Invalid snapshot owner metadata') from exc
+            if not isinstance(owner, str) or not Path(owner).is_absolute():
+                raise SnapshotError('Invalid snapshot owner metadata')
+            return Path(owner).resolve()
+    return None
+
+
+def _session_root(path: Path) -> Path:
+    """Anchor to this checkout, or the owner of a managed experiment."""
+    top = _root(path)
+    if top.parent.name == 'wt' and top.parent.parent.name == '.forgebox':
+        owner = top.parent.parent.parent
+        if _root(owner) == owner and re.fullmatch(r'[0-9a-f]{7,64}', top.name):
+            reference = f'refs/forgebox/snapshots/{top.name}'
+            refs = _git(owner, 'for-each-ref', '--format=%(refname)', reference).splitlines()
+            if reference.encode() in refs:
+                recorded = _snapshot_owner(owner, reference)
+                if recorded is None or recorded == owner:
+                    return owner
+    return top
 
 
 def _capture_tree(root: Path, base: str) -> str:
@@ -116,18 +167,12 @@ def _capture_tree(root: Path, base: str) -> str:
             _git(root, 'add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul',
                  input=b'\0'.join(force_paths) + b'\0', env=env)
         # Sparse absent files are not deletions; preserve their recorded blobs.
-        sparse_records = _git(root, 'ls-files', '-t', '-z').split(b'\0')
-        original = None
-        for record in sparse_records:
-            if record.startswith(b'S '):
-                path = os.fsdecode(record[2:])
-                if not (root / path).exists() and not (root / path).is_symlink():
-                    if original is None:
-                        original = _tree_entries(root, base)
-                    if path in original:
-                        mode, sha = original[path]
-                        _git(root, 'update-index', '--add', '--cacheinfo',
-                             mode, sha, path, env=env)
+        for path, (mode, sha) in _sparse_entries(root).items():
+            if path == '.forgebox' or path.startswith('.forgebox/'):
+                continue
+            if not (root / path).exists() and not (root / path).is_symlink():
+                _git(root, 'update-index', '--add', '--cacheinfo',
+                     mode, sha, path, env=env)
         return _git(root, 'write-tree', env=env).strip().decode()
 
 
@@ -160,7 +205,8 @@ def create_snapshot(repo_root: Path) -> Snapshot:
         raise SnapshotError('Submodules are not supported by isolated snapshots')
     identity = {'GIT_AUTHOR_NAME': 'Forgebox', 'GIT_AUTHOR_EMAIL': 'forgebox@localhost',
                 'GIT_COMMITTER_NAME': 'Forgebox', 'GIT_COMMITTER_EMAIL': 'forgebox@localhost'}
-    message = f'Forgebox snapshot {created_at} {uuid.uuid4().hex}\n'.encode()
+    message = (f'Forgebox snapshot {created_at} {uuid.uuid4().hex}\n\n'
+               f'Forgebox-Owner: {json.dumps(str(root))}\n').encode()
     commit = _git(root, 'commit-tree', tree, '-p', head, input=message,
                   env=identity).strip().decode()
     identifier = commit[:12]
@@ -177,3 +223,4 @@ def create_worktree(snap: Snapshot) -> Path:
     _git(snap.repo_root, 'worktree', 'add', '--detach', str(path), snap.commit_sha)
     snap.worktree_path = path
     return path
+

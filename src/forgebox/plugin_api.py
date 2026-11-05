@@ -55,29 +55,21 @@ def _git(repo: Path, *args: str) -> str:
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Git command failed")
-    return result.stdout.strip()
+    return result.stdout.removesuffix("\n")
 
 
 def _repo_root(path: Path) -> Path:
-    """Return the main worktree root even when started from a linked worktree.
+    """Keep ordinary linked checkouts separate from their sibling sessions."""
+    from forgebox.core.snapshot import _session_root
 
-    ``--show-toplevel`` echoes the enclosing checkout; inside a linked
-    worktree that is the linked checkout, not the repository root that owns
-    the ``refs/forgebox`` namespace.
-    """
-    top = Path(_git(path, "rev-parse", "--show-toplevel")).resolve()
-    if (top / ".git").is_file():
-        common = Path(_git(path, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        if common.name == ".git" and (common.parent / ".git").is_dir():
-            return common.parent.resolve()
-    return top
+    return _session_root(path)
 
 
 def _repo(params: dict) -> Path:
     raw = params.get("repo") or params.get("repo_root") or params.get("cwd")
     if raw is not None and not isinstance(raw, str):
         raise ValueError("repo must be a path string")
-    path = Path(raw.strip()).expanduser().resolve() if raw else Path.cwd()
+    path = Path(raw).expanduser().resolve() if raw else Path.cwd()
     return _repo_root(path)
 
 
@@ -94,6 +86,8 @@ def _sessions(repo: Path) -> list[dict]:
         location = next((f[9:] for f in fields if f.startswith("worktree ")), None)
         if location:
             worktrees[str(Path(location).resolve())] = True
+    from forgebox.core.snapshot import _snapshot_owner
+
     sessions = []
     for line in refs.splitlines():
         ref, commit_sha, created_at = line.split("\t", 2)
@@ -103,6 +97,19 @@ def _sessions(repo: Path) -> list[dict]:
             continue
         worktree = repo / ".forgebox" / "wt" / session_id
         active = str(worktree.resolve()) in worktrees and worktree.is_dir()
+        owner = _snapshot_owner(repo, commit_sha)
+        if owner is not None and owner != repo:
+            continue
+        if owner is None and str(worktree.resolve()) not in worktrees:
+            # Legacy refs are shared across checkouts and have no owner trailer.
+            # Do not invent ownership for an orphaned ref in another checkout.
+            metadata_path = repo / ".forgebox" / "active.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if metadata.get("id") != session_id:
+                continue
         sessions.append({
             "id": session_id, "repo": str(repo), "created_at": created_at,
             "status": "active" if active else "snapshot",
@@ -255,3 +262,4 @@ def __getattr__(name: str):
             )
         _router = router
     return _router
+
