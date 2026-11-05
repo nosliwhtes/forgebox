@@ -1,0 +1,26 @@
+# Forgebox — Hermes plugin catalog entry (draft for submission PR)
+# Schema review pending upstream contributor guide; minimal representative fields.
+id: forgebox
+name: Forgebox
+version: 0.1.0
+description: >-
+  Transactional try-then-commit execution backend for Hermes Agent. Snapshots a
+  dirty working tree into an ephemeral detached worktree, sandboxes agent writes,
+  and applies the result atomically — conflict-checked — or discards it.
+author: Seth Wilson
+license: MIT
+repository: https://github.com/nosliwhtes/forgebox
+kind: plugin
+surfaces:
+  hooks:
+    - pre_tool_call
+    - post_tool_call
+    - post_approval_response
+  dashboard:
+    - src/forgebox/plugin_api.py (HANDLERS, POST routes)
+    - desktop/plugin.js (pane UI)
+cli: "python -m forgebox.cli [begin|status|log|diff|preflight|apply|discard]"
+runtime:
+  python: ">=3.10"
+  deps: stdlib only (requires git CLI on PATH)
+status: draft
