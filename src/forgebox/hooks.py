@@ -1,6 +1,7 @@
 """Forgebox's keyword-argument Hermes hook entry points.
 
-Session discovery uses .forgebox/active.json in the current repo or an ancestor.
+Session discovery uses .forgebox/active.json in the task workspace or an
+ancestor of a supported file tool's target, even when the process cwd differs.
 The file contains Snapshot fields, optionally nested under ``snapshot``. Hosts
 may instead pass ``snapshot`` as a keyword; ``repo_root`` (or FORGEBOX_REPO_ROOT)
 selects a repo when the host's working directory is elsewhere. No active
@@ -27,6 +28,7 @@ _PATH_KEYS = {
     "source_path", "destination_path", "output_path", "input_path", "repo_root",
 }
 _COMMAND_KEYS = {"command", "cmd", "shell_command"}
+_CWD_KEYS = ("workdir", "cwd", "working_directory")
 # Hermes 0.21.6 file-tool schemas. Do not infer path semantics for arbitrary
 # plugin fields (e.g. search_files.target is an enum, not a file).
 _TOOL_PATH_KEYS = {name: {"path"} for name in
@@ -35,20 +37,62 @@ class _OutsideSandbox(ValueError):
     pass
 
 
+def _workspace_cwd(params: dict) -> Path:
+    """Use Hermes's per-task cwd without making the standalone CLI depend on it."""
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"agent", "agent.runtime_cwd"}:
+            raise
+        return Path.cwd().resolve()
+
+    task_id = params.get("task_id") or params.get("session_id")
+    if task_id:
+        from tools.terminal_tool import get_session_cwd, resolve_task_overrides
+
+        # A completed terminal cd takes precedence over the initial workspace.
+        raw = get_session_cwd(task_id) or resolve_task_overrides(task_id).get("cwd")
+        if isinstance(raw, (str, os.PathLike)) and raw:
+            path = Path(raw).expanduser()
+            if path.is_absolute():
+                return path.resolve()
+    return resolve_agent_cwd().resolve()
+
+
+def _requested_base(args: dict, caller: Path) -> Path:
+    raw = next((args.get(key) for key in _CWD_KEYS
+                if isinstance(args.get(key), (str, os.PathLike)) and args.get(key)), None)
+    if raw is None:
+        return caller
+    path = Path(raw).expanduser()
+    return (path if path.is_absolute() else caller / path).resolve()
+
+
+def _session_locations(params: dict) -> list[Path]:
+    caller = _workspace_cwd(params)
+    location = params.get("repo_root") or os.environ.get("FORGEBOX_REPO_ROOT")
+    if location:
+        path = Path(location).expanduser()
+        return [(path if path.is_absolute() else caller / path).resolve()]
+    args = params.get("args") or {}
+    base = _requested_base(args, caller)
+    locations = [base, caller]
+    for key in _TOOL_PATH_KEYS.get(params.get("tool_name"), ()):
+        value = args.get(key)
+        if isinstance(value, (str, os.PathLike)) and value:
+            path = Path(value).expanduser()
+            path = path if path.is_absolute() else base / path
+            # Starting at a file would raise NotADirectoryError before we
+            # reached its repository. New files may have missing parents.
+            locations.append(path if path.is_dir() else path.parent)
+    return locations
+
+
 def _get_session(params: dict) -> tuple[Any, Path, Path, Journal] | None:
     snapshot = params.get("snapshot")
     if snapshot is None:
-        args = params.get("args") or {}
-        location = params.get("repo_root") or os.environ.get("FORGEBOX_REPO_ROOT")
-        requested_cwd = next((args.get(key) for key in
-                              ("workdir", "cwd", "working_directory")
-                              if isinstance(args.get(key), (str, os.PathLike)) and args.get(key)), None)
-        locations = [location] if location else [requested_cwd, Path.cwd()]
         seen = set()
-        for location in locations:
-            if location is None:
-                continue
-            start = Path(location).expanduser().resolve()
+        for start in _session_locations(params):
             for root in (start, *start.parents):
                 if root in seen:
                     continue
@@ -108,15 +152,13 @@ def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path, base: Pa
     return str(target) + ("/" if trailing else "")
 
 
-def _caller_base(args: dict, repo: Path, worktree: Path) -> Path:
+def _caller_base(params: dict, repo: Path, worktree: Path) -> Path:
     """Resolve an explicit relative cwd against the caller, not against itself."""
-    cwd = Path.cwd().resolve()
-    caller = cwd if cwd.is_relative_to(repo) or cwd.is_relative_to(worktree) else repo
-    raw = args.get("workdir") or args.get("cwd") or args.get("working_directory")
-    if isinstance(raw, (str, os.PathLike)) and raw:
-        path = Path(raw).expanduser()
-        return (path if path.is_absolute() else caller / path).resolve()
-    return caller
+    cwd = _workspace_cwd(params)
+    if params.get("snapshot") or params.get("repo_root") or os.environ.get("FORGEBOX_REPO_ROOT"):
+        if not cwd.is_relative_to(repo) and not cwd.is_relative_to(worktree):
+            cwd = repo
+    return _requested_base(params.get("args") or {}, cwd)
 
 
 def _rewrite(value: Any, repo: Path, worktree: Path, base: Path, key: str = "") -> Any:
@@ -138,19 +180,19 @@ def _rewrite(value: Any, repo: Path, worktree: Path, base: Path, key: str = "") 
     return value
 
 
-def _paths(value: Any, repo: Path, worktree: Path, key: str = "") -> list[str]:
+def _paths(value: Any, repo: Path, worktree: Path, base: Path, key: str = "") -> list[str]:
     """Best-effort path hints, normalized back to the base repository."""
     found: list[str] = []
     if isinstance(value, dict):
         for child_key, child in value.items():
-            found.extend(_paths(child, repo, worktree, str(child_key).lower()))
+            found.extend(_paths(child, repo, worktree, base, str(child_key).lower()))
     elif isinstance(value, (list, tuple)):
         for child in value:
-            found.extend(_paths(child, repo, worktree, "path" if key == "changed_files" else key))
+            found.extend(_paths(child, repo, worktree, base, "path" if key == "changed_files" else key))
     elif isinstance(value, (str, os.PathLike)) and (key in _PATH_KEYS or key == "changed_files"):
         path = Path(value).expanduser()
         if not path.is_absolute():
-            path = repo / path
+            path = base / path
         path = path.resolve()
         if path.is_relative_to(worktree):
             found.append(str(path.relative_to(worktree)))
@@ -170,11 +212,13 @@ def _record(session: tuple, params: dict, event: str, **extra: Any) -> None:
             result = None
     exit_code = result.get("exit_code", result.get("returncode")) if isinstance(result, dict) else None
     command = args.get("command", args.get("cmd", params.get("tool_name"))) if isinstance(args, dict) else params.get("tool_name")
+    base = _caller_base(params, repo, worktree)
+    path_args = {key: str(base) if key in _CWD_KEYS else value for key, value in args.items()}
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "event": event,
         "task_id": params.get("task_id"), "name": params.get("tool_name"),
         "command": command, "exit_code": exit_code,
-        "changed_files": sorted(set(_paths(args, repo, worktree) + _paths(result, repo, worktree))),
+        "changed_files": sorted(set(_paths(path_args, repo, worktree, base) + _paths(result, repo, worktree, base))),
     }
     if isinstance(result, dict) and "tests_run" in result:
         entry["tests_run"] = result["tests_run"]
@@ -192,10 +236,9 @@ def pre_tool_call(tool_name: str = "", args: dict | None = None,
     _, repo, worktree, _ = session
     original = args or {}
     try:
-        base = _caller_base(original, repo, worktree)
+        base = _caller_base(params, repo, worktree)
         # Cwd fields are relative to the caller, while other paths are relative
         # to the requested cwd. Do not flatten a requested subdirectory.
-        cwd_keys = {"cwd", "workdir", "working_directory"}
         if tool_name == "patch" and original.get("mode") == "patch":
             result = {"action": "block", "message":
                       "Forgebox: multi-file patch mode is not redirected; use patch replace mode or write_file"}
@@ -206,7 +249,7 @@ def pre_tool_call(tool_name: str = "", args: dict | None = None,
         if tool_name == "search_files" and not path_args.get("path"):
             path_args["path"] = "."
         rewritten = {**original, **_rewrite(path_args, repo, worktree, base)}
-        for key in cwd_keys.intersection(original):
+        for key in set(_CWD_KEYS).intersection(original):
             rewritten[key] = _rewrite_path(base, repo, worktree, repo)
         if tool_name == "terminal" and any(key in original for key in _COMMAND_KEYS):
             cwd_key = "workdir" if tool_name == "terminal" else "cwd"

@@ -25,6 +25,7 @@ elif importlib.util.find_spec("hermes_cli") is None:
     pytest.skip("Set HERMES_SOURCE to run real Hermes integration tests", allow_module_level=True)
 
 from hermes_cli.plugins import PluginContext, PluginManager, parse_manifest_file
+from agent.runtime_cwd import reset_session_cwd, set_session_cwd
 
 
 @pytest.fixture
@@ -104,3 +105,110 @@ def test_real_manager_records_result_and_only_observes_approval(cli_session, plu
     assert any(e.get("event") == "post_tool_call" and e.get("exit_code") == 3 for e in journal)
     assert any(e.get("event") == "post_approval_response" and e.get("choice") == "approve"
                for e in journal)
+
+
+def test_absolute_file_path_discovers_session_outside_repo(
+    cli_session, plugin_manager, tmp_path, monkeypatch,
+):
+    repo, worktree = cli_session
+    launch = tmp_path / "unrelated launch directory"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    original = (repo / "tracked.txt").read_text()
+    args = {"path": str(repo / "tracked.txt"), "content": "sandbox edit\n"}
+    task_id = "integration-absolute-discovery"
+    token = set_session_cwd(str(launch))
+    try:
+        result = plugin_manager.invoke_hook(
+            "pre_tool_call", tool_name="write_file", args=args,
+            session_id="hermes-session", task_id=task_id,
+        )
+        assert result == [{"action": "modify", "args": {
+            **args, "path": str(worktree / "tracked.txt"),
+        }}]
+        rewritten = result[0]["args"]
+        Path(rewritten["path"]).write_text(rewritten["content"])
+        assert plugin_manager.invoke_hook(
+            "post_tool_call", tool_name="write_file", args=rewritten,
+            result={"success": True}, session_id="hermes-session", task_id=task_id,
+        ) == []
+    finally:
+        reset_session_cwd(token)
+    assert (repo / "tracked.txt").read_text() == original
+    assert (worktree / "tracked.txt").read_text() == args["content"]
+    assert not (launch / "tracked.txt").exists()
+    assert [entry["event"] for entry in entries(repo) if entry.get("task_id") == task_id] == [
+        "pre_tool_call", "post_tool_call",
+    ]
+
+
+@pytest.mark.parametrize("workspace_source", ["runtime-context", "task-override", "task-record"])
+def test_relative_file_path_uses_nested_hermes_workspace(
+    cli_session, plugin_manager, tmp_path, monkeypatch, workspace_source,
+):
+    repo, worktree = cli_session
+    launch = tmp_path / "unrelated launch directory"
+    launch.mkdir()
+    (launch / "new.txt").write_text("launch file must stay unchanged\n")
+    monkeypatch.chdir(launch)
+    nested = repo / "nested"
+    original = (nested / "new.txt").read_text()
+    task_id = f"integration-relative-{workspace_source}"
+    task_workspace = workspace_source != "runtime-context"
+    if task_workspace:
+        from tools.terminal_tool import (
+            clear_task_env_overrides, record_session_cwd, register_task_env_overrides,
+        )
+    args = {"path": "new.txt", "content": "nested sandbox edit\n"}
+    token = set_session_cwd(str(repo if task_workspace else nested))
+    try:
+        if task_workspace:
+            initial = repo if workspace_source == "task-record" else nested
+            register_task_env_overrides(task_id, {"cwd": str(initial)})
+            if workspace_source == "task-record":
+                record_session_cwd(task_id, str(nested))
+        result = plugin_manager.invoke_hook(
+            "pre_tool_call", tool_name="write_file", args=args,
+            session_id="hermes-session", task_id=task_id,
+        )
+        assert result == [{"action": "modify", "args": {
+            **args, "path": str(worktree / "nested" / "new.txt"),
+        }}]
+        rewritten = result[0]["args"]
+        Path(rewritten["path"]).write_text(rewritten["content"])
+        assert plugin_manager.invoke_hook(
+            "post_tool_call", tool_name="write_file", args=rewritten,
+            result={"success": True}, session_id="hermes-session", task_id=task_id,
+        ) == []
+    finally:
+        if task_workspace:
+            clear_task_env_overrides(task_id)
+        reset_session_cwd(token)
+    assert (nested / "new.txt").read_text() == original
+    assert (worktree / "nested" / "new.txt").read_text() == args["content"]
+    assert (launch / "new.txt").read_text() == "launch file must stay unchanged\n"
+    assert not (repo / "new.txt").exists()
+    assert not (worktree / "new.txt").exists()
+    journal = [entry for entry in entries(repo) if entry.get("task_id") == task_id]
+    assert [entry["event"] for entry in journal] == [
+        "pre_tool_call", "post_tool_call",
+    ]
+    assert all(entry["changed_files"] == ["nested/new.txt"] for entry in journal)
+
+
+def test_workspace_without_session_does_not_inherit_process_session(
+    cli_session, plugin_manager, tmp_path,
+):
+    repo, _ = cli_session
+    workspace = tmp_path / "other workspace"
+    workspace.mkdir()
+    args = {"path": "file.txt", "content": "ordinary edit"}
+    before = entries(repo)
+    token = set_session_cwd(str(workspace))
+    try:
+        assert plugin_manager.invoke_hook(
+            "pre_tool_call", tool_name="write_file", args=args, task_id="other-workspace",
+        ) == []
+    finally:
+        reset_session_cwd(token)
+    assert entries(repo) == before

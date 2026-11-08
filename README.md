@@ -100,6 +100,8 @@ To request a Git commit, use `forgebox apply --repo "$REPO" --commit-message "Ac
 
 With registered Hermes hooks active (Hermes 0.21.6+), supported file-path arguments and command working directories are redirected and tool calls are journaled. Shell source is preserved verbatim to avoid corrupting scripts, literals, and here-documents. Absolute paths in shell commands, `cd`, dynamically generated paths, and subprocess writes are not rewritten or contained. Commands you run directly in another shell are not intercepted or journaled. Supported file tools are `read_file`, `write_file`, `search_files`, and `patch` replace mode. Multi-file `patch` mode is blocked during an active session because its embedded headers are not redirected. Unknown plugin-tool fields are left untouched. Approval hooks only record decisions; apply explicitly with `forgebox apply` or the dashboard/Desktop panel.
 
+Hooks discover the active session from Hermes's task working directory or a supported file tool's target. Relative paths keep the task's current subdirectory, including after a terminal `cd`; the gateway or Desktop process can run elsewhere. A task workspace without a session does not inherit one from the process's launch directory.
+
 ## Architecture
 
 ```text
@@ -139,5 +141,6 @@ python -m pytest tests/
 
 The Hermes integration job also checks the real PluginManager against Hermes
 0.21.6 (pinned in CI). To run it locally, check out that Hermes version, install
-`ruamel.yaml`, and set `HERMES_SOURCE=/path/to/hermes-agent` when running pytest.
+the integration dependencies listed in `.github/workflows/ci.yml`, and set
+`HERMES_SOURCE=/path/to/hermes-agent` when running pytest.
 Without Hermes available, only that integration module is skipped.

@@ -177,6 +177,7 @@ def test_subdirectory_and_relative_paths_keep_their_meaning(cli_session, hooks):
         "cwd": "nested", "path": "new.txt", "content": "a/b"})
     assert result["args"]["cwd"] == str(worktree / "nested")
     assert result["args"]["path"] == str(worktree / "nested/new.txt")
+    assert _journal_entries(repo)[-1]["changed_files"] == ["nested", "nested/new.txt"]
     result = hooks.pre_tool_call(tool_name="terminal", args={
         "workdir": str(repo / "nested"), "command": "cat new.txt"})
     assert result["args"]["workdir"] == str(worktree / "nested")
@@ -270,3 +271,23 @@ def test_unsupported_multi_file_patch_is_blocked(cli_session, hooks):
 def test_unknown_tool_path_fields_are_not_guessed(cli_session, hooks):
     args = {"path": "a/b", "target": "content", "source": "print('hi')"}
     assert hooks.pre_tool_call(tool_name="custom_plugin_tool", args=args) is None
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "write_file", "patch", "search_files"])
+def test_absolute_targets_discover_session_outside_cwd(cli_session, hooks, monkeypatch, tool_name):
+    repo, worktree = cli_session
+    monkeypatch.chdir(repo.parent)
+    result = hooks.pre_tool_call(tool_name=tool_name, args={"path": str(repo / "nested/new.txt")})
+    assert result == {"action": "modify", "args": {"path": str(worktree / "nested/new.txt")}}
+
+
+def test_absolute_symlink_target_cannot_bypass_session_discovery(cli_session, hooks, monkeypatch):
+    repo, _ = cli_session
+    outside = repo.parent / "outside-directory"
+    outside.mkdir()
+    (repo / "escape-link").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(repo.parent)
+    result = hooks.pre_tool_call(tool_name="write_file", args={
+        "path": str(repo / "escape-link" / "escaped.txt"), "content": "blocked"})
+    assert result == {"action": "block", "message": "Forgebox: path outside sandbox"}
+    assert not (outside / "escaped.txt").exists()
