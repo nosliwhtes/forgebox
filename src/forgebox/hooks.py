@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .core.snapshot import Snapshot, SnapshotError, _check_worktree, _git, _validate
 from .journal import Journal
 
 
@@ -90,6 +91,7 @@ def _session_locations(params: dict) -> list[Path]:
 
 def _get_session(params: dict) -> tuple[Any, Path, Path, Journal] | None:
     snapshot = params.get("snapshot")
+    discovered_root = None
     if snapshot is None:
         seen = set()
         for start in _session_locations(params):
@@ -107,31 +109,47 @@ def _get_session(params: dict) -> tuple[Any, Path, Path, Journal] | None:
                 if not isinstance(metadata, dict):
                     return None
                 snapshot = metadata.get("snapshot", metadata)
+                discovered_root = root.resolve()
                 break
             if snapshot is not None:
                 break
     if snapshot is None:
         return None
-    if isinstance(snapshot, dict):
-        snapshot = SimpleNamespace(**snapshot)
     try:
+        if isinstance(snapshot, dict):
+            snapshot = SimpleNamespace(**snapshot)
         if not snapshot.worktree_path:
             return None
-        repo = Path(snapshot.repo_root).expanduser().resolve()
-        worktree = Path(snapshot.worktree_path).expanduser().resolve()
-        session_id = str(snapshot.id)
-        # Never let an on-disk session identifier choose an arbitrary journal.
-        if not session_id or session_id in {".", ".."} or any(c in session_id for c in "/\\"):
+        # Normalize a copy, never the caller's snapshot. Do not resolve away
+        # symlinks before core checks the reserved worktree storage.
+        snapshot = Snapshot(
+            id=snapshot.id, repo_root=Path(snapshot.repo_root).expanduser().resolve(),
+            commit_sha=snapshot.commit_sha,
+            base_head_sha=getattr(snapshot, "base_head_sha", ""),
+            created_at=getattr(snapshot, "created_at", ""),
+            worktree_path=Path(snapshot.worktree_path).expanduser(),
+        )
+        repo = _validate(snapshot)
+        if repo != snapshot.repo_root or (discovered_root is not None and discovered_root != repo):
             return None
-        if not worktree.is_dir():
+        reference = f"refs/forgebox/snapshots/{snapshot.id}"
+        if _git(repo, "rev-parse", "--verify", reference).strip().decode() != snapshot.commit_sha:
             return None
-    except (AttributeError, TypeError, ValueError, OSError):
+        worktree = _check_worktree(snapshot, snapshot.worktree_path)
+        # A separate repository at the expected path is not our worktree.
+        registered = _git(repo, "worktree", "list", "--porcelain", "-z").split(b"\0")
+        if b"worktree " + os.fsencode(worktree) not in registered:
+            return None
+        common = lambda path: (path / os.fsdecode(
+            _git(path, "rev-parse", "--git-common-dir").rstrip(b"\n"))).resolve()
+        if common(repo) != common(worktree):
+            return None
+        journal_path = repo / ".forgebox" / snapshot.id / "journal.jsonl"
+        if journal_path.parent.is_symlink() or journal_path.is_symlink():
+            return None
+    except (SnapshotError, AttributeError, TypeError, ValueError, OSError, RuntimeError):
         return None
-    # Core's contract uses Path fields, including for persisted sessions.
-    if isinstance(snapshot, SimpleNamespace):
-        snapshot.repo_root = repo
-        snapshot.worktree_path = worktree
-    return snapshot, repo, worktree, Journal(repo / ".forgebox" / session_id / "journal.jsonl")
+    return snapshot, repo, worktree, Journal(journal_path)
 
 
 def _rewrite_path(value: str | os.PathLike, repo: Path, worktree: Path, base: Path) -> str:
