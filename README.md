@@ -25,7 +25,40 @@ Forgebox makes the experiment a transaction: **begin → edit and test → revie
 
 ## Install
 
-Requires **Python 3.10+ and Git** on Linux or macOS. Runtime code uses Python's standard library and the Git CLI; pytest is development-only.
+Requires **Python 3.10+ and Git** on Linux or macOS. The core uses Python's
+standard library and the Git CLI; Hermes supplies FastAPI for the dashboard API.
+
+### Hermes plugin (catalog install)
+
+```bash
+hermes plugins install forgebox
+hermes plugins enable forgebox
+hermes plugins list
+```
+
+Restart the gateway and start a fresh Hermes session after enabling. The catalog
+package includes the agent hooks, dashboard backend, and desktop pane. No separate
+`pip install -e .` is required for hooks or dashboard requests: the dashboard shim
+makes the bundled `src/` package importable, including deferred core imports.
+If your catalog does not yet include Forgebox, install the same package by URL:
+
+```bash
+hermes plugins install https://github.com/nosliwhtes/forgebox
+hermes plugins enable forgebox
+```
+
+### Desktop pane
+
+In **Settings → Plugins** (or **Capabilities → Plugins**), use **Rescan** if needed
+and enable Forgebox's desktop half. Then use **Reload desktop plugins** in the
+command palette. Backend enablement and desktop enablement are separate steps.
+The bundled `dashboard/manifest.json` mounts `/api/plugins/forgebox/` without adding
+a blank dashboard tab. See [desktop/INSTALL.md](desktop/INSTALL.md) for profile and
+remote-gateway setup. Copying `desktop/plugin.js` alone does not install the backend.
+
+### Standalone CLI (optional)
+
+To install the `forgebox` shell command, independently of catalog installation:
 
 ```bash
 git clone https://github.com/nosliwhtes/forgebox.git
@@ -33,31 +66,6 @@ cd forgebox
 python3 -m pip install -e .
 forgebox --help
 ```
-
-### Hermes plugin
-
-For a native-plugin-packaged revision, install by repository URL rather than assuming a catalog listing:
-
-```bash
-hermes plugins install https://github.com/nosliwhtes/forgebox --no-enable
-hermes plugins enable forgebox
-hermes plugins list
-```
-
-Start a fresh Hermes session after enabling. The native installer requires a `plugin.yaml` manifest and a registered plugin entry point. If your checkout does not include that packaging, use the standalone CLI; installing the Python package or copying hook functions does **not** activate Hermes interception.
-
-### Desktop pane
-
-The desktop UI and Python hooks are separate activation steps. From the cloned Forgebox directory, install the pane into the active Hermes profile:
-
-```bash
-HERMES_PROFILE_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_PROFILE_HOME/desktop-plugins/forgebox"
-cp desktop/plugin.js "$HERMES_PROFILE_HOME/desktop-plugins/forgebox/plugin.js"
-hermes desktop
-```
-
-Open **Settings → Plugins** and enable Forgebox if it is disabled. If it has not appeared, use **Reload desktop plugins** in the command palette. The pane needs the enabled Forgebox Python backend to load session data and perform actions; copying JavaScript alone does not install that backend. A packaged plugin may instead ship the pane under `plugins/forgebox/desktop/plugin.js`; enable that desktop half in Settings too.
 
 ## Usage
 
@@ -116,6 +124,7 @@ See [ARCH.md](ARCH.md) for the module boundaries and public interfaces.
 ## Safety guarantees and limits
 
 - **Advisory redirection:** known hook-mediated file-path arguments and command working directories are checked and redirected on a best-effort basis. Shell command text is not rewritten. This is a worktree workflow, not an OS security sandbox. Do not rely on it to contain hostile shell commands, subprocesses, network calls, or external services.
+- **Git subprocess environment:** Git inherits only `PATH`, `HOME`, locale and temporary-directory settings, and author/committer identity, not provider API keys or other ambient credentials. This is not a sandbox: repository hooks and filters can still execute, including commit hooks when you explicitly request a commit.
 - **Preserve the starting point:** snapshots use a temporary Git index. Begin does not stage your work in the real index or require a normal commit. Session files and worktrees live under `.forgebox/`.
 - **Preflight conflicts:** every path the experiment changes is compared with its snapshot state in the real repo. If an affected file changed, default apply refuses the transaction rather than silently overwriting it. `--force` opts out.
 - **Rollback-protected apply:** the patch is checked and applied in staging before live files change. Renamed originals are retained until installation succeeds, and ordinary write failures trigger rollback. If rollback also fails, the error names the recovery directory under `.forgebox/apply-*`; preserve it and recover the originals before retrying. This is not crash-atomic or safe against simultaneous external editors, and optional Git commits are separate.
@@ -135,7 +144,7 @@ The [demo storyboard](docs/DEMO.md) starts with a dirty repo, discards a broken 
 ## Development checks
 
 ```bash
-python -m pip install -e . pytest
+python -m pip install -e . pytest 'fastapi>=0.115,<1' 'httpx>=0.27,<1'
 python -m pytest tests/
 ```
 
@@ -143,4 +152,8 @@ The Hermes integration job also checks the real PluginManager against Hermes
 0.21.6 (pinned in CI). To run it locally, check out that Hermes version, install
 the integration dependencies listed in `.github/workflows/ci.yml`, and set
 `HERMES_SOURCE=/path/to/hermes-agent` when running pytest.
-Without Hermes available, only that integration module is skipped.
+The dashboard installation tests also exercise all REST endpoints from a clean
+catalog-style copy with no installed Forgebox package or inherited PYTHONPATH.
+Without Hermes available, the real PluginManager integration module and the
+Hermes-loader dashboard cases are skipped; the direct dashboard-shim cases still run.
+

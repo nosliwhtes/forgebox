@@ -6,60 +6,50 @@ Apply and Discard require a second confirmation click. The pane never force-appl
 or creates a Git commit. Apply leaves the session available for review; Discard
 removes it and clears matching CLI active-session metadata.
 
-## 1. Make the core importable on the gateway
+## 1. Install the unified plugin
 
-Install Forgebox in **the Python environment running the Hermes gateway**, not an
-unrelated system Python. From this checkout, using that environment's Python:
+On the machine running the Hermes gateway, install into the selected profile
+(set `HERMES_HOME` first for a named profile):
 
 ```sh
-cd /home/nosliwhtes/Projects/forgebox
-python -m pip install -e .
-python -c 'import forgebox; print(forgebox.__file__)'
+hermes plugins install forgebox
+hermes plugins enable forgebox
 ```
 
-The core uses Python 3.10+, the standard library, and Git. `HANDLERS` can be imported
-without FastAPI or the core modules being present; actual actions need the core.
-For REST mounting, this module also exposes a lazy `router` using FastAPI already
-provided by Hermes. No separate HTTP service or WebSocket endpoint is required.
+If Forgebox is not yet available in your catalog, use
+`hermes plugins install https://github.com/nosliwhtes/forgebox` instead.
+The package includes `plugin.yaml`, agent hooks, `src/forgebox/`,
+`dashboard/manifest.json`, `dashboard/plugin_api.py`, and `desktop/plugin.js`.
+Keep the whole package together. The dashboard shim imports the bundled core
+without a separate pip install in the gateway environment. Hermes supplies FastAPI;
+Python 3.10+ and Git are required. No separate HTTP server is needed.
 
-## 2. Copy the backend and desktop files
+The bundled dashboard manifest declares the backend and hides the unused web tab:
 
-These commands use `~/.hermes` by default. For a named profile, set `HERMES_HOME`
-to its directory for the **backend**. On a remote gateway, install the backend and
-Python package on that remote machine, and the desktop file locally.
+```json
+{"name":"forgebox","api":"plugin_api.py","tab":{"hidden":true}}
+```
+
+## 2. Make the desktop half available locally
+
+For a local unified install, the desktop app syncs the package's
+`desktop/plugin.js` into its app-level plugin directory. Use **Rescan** after
+installation. Do not maintain conflicting copies.
+
+An agent package installed only on a remote gateway cannot supply a local desktop
+file automatically. Install the unified package locally too, or copy just the
+pane from a matching Forgebox checkout on the desktop machine:
 
 ```sh
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/plugins/forgebox/dashboard"
-cp src/forgebox/plugin_api.py "$HERMES_HOME/plugins/forgebox/dashboard/plugin_api.py"
-
-# Desktop plugins are app-level. Use the local desktop app's plugin root.
 mkdir -p "$HOME/.hermes/desktop-plugins/forgebox"
 cp desktop/plugin.js "$HOME/.hermes/desktop-plugins/forgebox/plugin.js"
 ```
 
-The backend directory also needs `dashboard/manifest.json` with:
-
-```json
-{"name":"forgebox","api":"plugin_api.py"}
-```
-
-Keep the Forgebox agent package's existing `plugin.yaml` if one is installed.
-For a backend-only manual installation, provide this minimal package descriptor at
-`$HERMES_HOME/plugins/forgebox/plugin.yaml` (do not overwrite existing hooks):
-
-```yaml
-name: forgebox
-version: 0.1.0
-description: Transactional Git worktree review and apply
-```
-
-Alternatively, put the desktop file at
-`$HERMES_HOME/plugins/forgebox/desktop/plugin.js` in the **local unified package**,
-next to its `dashboard/` directory and `plugin.yaml`. The app syncs that desktop
-half into its app-level plugin directory. Use **Rescan** after changes to a copied
-unified package. Do not maintain two conflicting copies. An agent package installed
-only on a remote machine cannot supply a local desktop file automatically.
+Copying the pane alone does not install the remote backend. Do not copy only
+`src/forgebox/plugin_api.py` to the gateway; its deferred imports need the core.
+Installing the standalone CLI with `python -m pip install -e .` is optional and
+separate from catalog installation, but is required for the `forgebox` shell
+commands shown below unless you already have that command installed.
 
 ## 3. Enable both halves
 
@@ -110,8 +100,9 @@ the affected state before showing completion.
 
 - **404:** check the manifest, correct gateway profile, backend allow-list and
   gateway restart. The desktop toggle alone cannot mount Python routes.
-- **Import error:** ensure `forgebox` is installed in the gateway's own Python
-  environment. A copied API file alone is not the core package.
+- **Import error:** reinstall the complete unified package in the gateway profile.
+  Check that `src/forgebox/` is beside `dashboard/`, and that the dashboard contains
+  the shim from this package, not a standalone copy of the canonical API file.
 - **No snapshots:** check the desktop cwd; snapshots are repository-scoped, not
   Hermes conversation IDs. Existing dirty files are captured by `forgebox begin`.
 - **Session without worktree:** only Discard is available; do not Apply it.
@@ -132,3 +123,4 @@ The last check is a no-session smoke test, not proof that Apply worked. When no
 snapshot exists, error dicts for session-dependent operations are expected. Actual
 desktop rendering, theme switching and authenticated remote routing must also be
 checked in the Hermes app; syntax checks cannot certify those behaviors.
+

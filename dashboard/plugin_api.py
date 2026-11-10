@@ -14,9 +14,13 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_PLUGIN_API = (
-    Path(__file__).resolve().parent.parent / "src" / "forgebox" / "plugin_api.py"
-)
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src"
+_PLUGIN_API = _SOURCE_ROOT / "forgebox" / "plugin_api.py"
+
+# Catalog installs copy the plugin tree without installing a Python distribution.
+# Keep its source root available for deferred imports made by request handlers.
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
 
 
 def _load_impl():
@@ -34,3 +38,4 @@ def _load_impl():
 
 _impl = _load_impl()
 router = _impl.router
+

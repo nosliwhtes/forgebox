@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from functools import wraps
 import json
-import os
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -47,11 +46,11 @@ def _handler(function):
 
 
 def _git(repo: Path, *args: str) -> str:
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    from forgebox.core.git_env import git_environment
+
     result = subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True,
-        errors="replace", timeout=30, check=False, env=environment,
+        errors="replace", timeout=30, check=False, env=git_environment(),
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Git command failed")
@@ -262,4 +261,5 @@ def __getattr__(name: str):
             )
         _router = router
     return _router
+
 
