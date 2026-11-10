@@ -13,6 +13,8 @@ import tempfile
 from typing import Iterator
 import uuid
 
+from .git_env import git_environment
+
 
 class SnapshotError(Exception):
     """A Git operation failed or a snapshot cannot be handled safely."""
@@ -30,15 +32,8 @@ class Snapshot:
 
 def _git(root: Path, *args: str, input: bytes | None = None,
          env: dict[str, str] | None = None) -> bytes:
-    """Run Git without ambient repository/index overrides or optional locks."""
-    environment = os.environ.copy()
-    for key in list(environment):
-        if key.startswith('GIT_') and key not in {
-            'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_AUTHOR_DATE',
-            'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
-        }:
-            environment.pop(key)
-    environment['GIT_OPTIONAL_LOCKS'] = '0'
+    """Run Git with allowlisted host settings and explicit internal overrides."""
+    environment = git_environment()
     if env:
         environment.update(env)
     literal = [] if environment.get('GIT_LITERAL_PATHSPECS') == '0' else ['--literal-pathspecs']
@@ -223,4 +218,5 @@ def create_worktree(snap: Snapshot) -> Path:
     _git(snap.repo_root, 'worktree', 'add', '--detach', str(path), snap.commit_sha)
     snap.worktree_path = path
     return path
+
 
