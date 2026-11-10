@@ -4,15 +4,17 @@ import os
 
 
 _HOST_VARIABLES = frozenset({
-    "PATH", "HOME", "LANG", "TMPDIR",
+    "PATH", "HOME", "XDG_CONFIG_HOME", "LANG", "TMPDIR",
     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
 })
 
 
 def git_environment() -> dict[str, str]:
-    """Keep identity/locale settings, not provider keys or ambient Git overrides.
+    """Keep Git config locations/identity/locale, not provider keys or overrides.
 
+    XDG_CONFIG_HOME preserves global ignore rules and core.excludesFile settings
+    used when snapshots exclude untracked secrets.
     Repository hooks and filters inherit this environment too. This limits
     accidental credential exposure; it does not sandbox repository code.
     """

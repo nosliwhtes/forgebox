@@ -38,7 +38,7 @@ def test_git_children_receive_only_allowlisted_host_environment(
     names = ("FORGEBOX_TEST_HOST_SECRET", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
              "PYTHONPATH", "GIT_DIR", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT",
              "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_OPTIONAL_LOCKS",
-             "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
+             "PATH", "HOME", "XDG_CONFIG_HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
              "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
              "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE")
     probe = "!env | grep -E '^(" + "|".join(names) + ")='"
@@ -52,7 +52,7 @@ def test_git_children_receive_only_allowlisted_host_environment(
         assert key not in child
     # Git prefixes its own executable directory when invoking shell aliases.
     assert child["PATH"].endswith(os.environ["PATH"])
-    for key in ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
+    for key in ("HOME", "XDG_CONFIG_HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
                 "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
                 "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"):
         assert child[key] == os.environ[key]
@@ -91,3 +91,37 @@ def test_core_git_preserves_explicit_temporary_index(
     assert temporary_index.is_file()
     assert not (tmp_path / "ambient-index").exists()
     assert (git_repo / ".git/index").read_bytes() == original
+
+
+@pytest.mark.parametrize("ignore_source", ["xdg-ignore", "xdg-config"])
+def test_snapshot_preserves_xdg_global_ignore_rules(
+    git_repo, git, snapshot_api, apply_api, tmp_path, monkeypatch, ignore_source,
+):
+    # An ignored untracked file must stay out of both Git objects and the
+    # experiment, even when the user keeps Git settings outside ~/.config.
+    config_home = tmp_path / "custom config home"
+    git_config = config_home / "git"
+    git_config.mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    if ignore_source == "xdg-ignore":
+        (git_config / "ignore").write_text("secret.key\n", encoding="utf-8")
+    else:
+        excludes = tmp_path / "custom-excludes"
+        excludes.write_text("secret.key\n", encoding="utf-8")
+        git(git_repo, "config", "--file", str(git_config / "config"),
+            "core.excludesFile", str(excludes))
+    (git_repo / "secret.key").write_text("test sentinel, not a credential\n", encoding="utf-8")
+    (git_repo / "visible.txt").write_text("include this untracked file\n", encoding="utf-8")
+    assert git(git_repo, "check-ignore", "secret.key").stdout.strip() == "secret.key"
+
+    snap = snapshot_api.create_snapshot(git_repo)
+    try:
+        files = git(git_repo, "ls-tree", "--name-only", "-r", snap.commit_sha).stdout.splitlines()
+        assert "secret.key" not in files
+        assert "visible.txt" in files
+        worktree = snapshot_api.create_worktree(snap)
+        assert not (worktree / "secret.key").exists()
+        assert (worktree / "visible.txt").read_text() == "include this untracked file\n"
+    finally:
+        apply_api.discard(git_repo, snap)
